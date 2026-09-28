@@ -317,6 +317,9 @@ constexpr const char *kParallelLoopRequiresPaddingGuard =
     "parallel_loop_requires_padding_guard";
 // ForAttr, Width (in elements) for coalesced memory access
 constexpr const char *kCoalescedWidth = "coalesced_width";
+// Internal ForAttr, Minimum width (in elements) for coalesced memory access.
+// Unlike kCoalescedWidth, this does not cap a naturally wider legal access.
+constexpr const char *kMinCoalescedWidth = "min_coalesced_width";
 } // namespace attr
 
 } // namespace tl

@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -83,6 +84,286 @@ bool GetIsAsyncCopy(const CopyNode &op) {
 
 bool GetNoImplicitAsyncCommitWait(const CopyNode &op) {
   return GetBoolAnnotation(op, attr::kAsyncCopyNoImplicitCommitWait);
+}
+
+constexpr int kPPUAsyncCopyMinTransferBits = 32;
+
+bool HasSafeFourByteAlignedBase(const Buffer &buffer,
+                                arith::Analyzer *analyzer) {
+  // LowerAccessPtr currently forms the pointer from load indices only and does
+  // not fold Buffer::elem_offset into tl.access_ptr.  Until that common pass is
+  // fixed, only a zero buffer-level offset is safe here.  Region minima are
+  // checked separately against the final physical layout before lowering.
+  return buffer->data_alignment >= 4 && buffer->data_alignment % 4 == 0 &&
+         analyzer->CanProve(buffer->elem_offset == 0);
+}
+
+bool IsSupportedPPUSubwordAsyncCopyType(DataType dtype) {
+  if (!dtype.is_scalar()) {
+    return false;
+  }
+  if (dtype.is_float4_e2m1fn()) {
+    // FP4 remains a logical four-bit dtype here.  Eight adjacent logical
+    // elements form the minimum four-byte PPU async-copy transaction.
+    return true;
+  }
+  if (dtype.bits() == 8) {
+    // Only admit scalar types the PPU code generator can represent.  In
+    // particular, float4_e2m1_unpacked also occupies eight storage bits but is
+    // an internal shared-memory storage tag, not an FP8 register type.
+    return dtype.is_int() || dtype.is_uint() || dtype.is_float8_e4m3() ||
+           dtype.is_float8_e4m3fn() || dtype.is_float8_e5m2() ||
+           dtype.is_float8_e8m0fnu();
+  }
+  if (dtype.bits() == 16) {
+    return dtype.is_int() || dtype.is_uint() || dtype.is_float16() ||
+           dtype.is_bfloat16();
+  }
+  return false;
+}
+
+bool IsPPUSubwordAsyncCopyAutoWidthCandidate(const CopyNode &op,
+                                             ppu::CopyInst copy_inst) {
+  return copy_inst == ppu::CopyInst::kCPAsync &&
+         GetNoImplicitAsyncCommitWait(op) && !GetIsAsyncCopy(op) &&
+         !op.annotations.count(attr::kCoalescedWidth) &&
+         !op.annotations.count(attr::kParallelLoopLayout) &&
+         IsGlobalBuffer(op.src) && IsSharedBuffer(op.dst) &&
+         op.src->dtype == op.dst->dtype &&
+         IsSupportedPPUSubwordAsyncCopyType(op.src->dtype);
+}
+
+enum class PPUAsyncCopyWidthAction {
+  kNotApplicable,
+  kValidateNaturalWidth,
+  kPromote,
+  kForceSynchronous,
+};
+
+struct PPUAsyncCopyWidthPlan {
+  PPUAsyncCopyWidthAction action;
+  int min_width;
+};
+
+PPUAsyncCopyWidthPlan PlanPPUAsyncCopyWidth(
+    const CopyNode &op, ppu::CopyInst copy_inst, Range thread_bounds,
+    const Map<Buffer, Buffer> &buffer_remap, arith::Analyzer *analyzer) {
+  int scalar_bits = op.src->dtype.bits();
+
+  if (!IsPPUSubwordAsyncCopyAutoWidthCandidate(op, copy_inst)) {
+    return {PPUAsyncCopyWidthAction::kNotApplicable, 1};
+  }
+  int min_elements = kPPUAsyncCopyMinTransferBits / scalar_bits;
+
+  // Automatic width planning is intentionally limited to statically sized,
+  // non-empty copies.  Preserve the established lowering for symbolic sizes
+  // instead of turning an inability to prove the new policy into a
+  // synchronous-copy requirement.
+  PrimExpr total_elements = IntImm(DataType::Int(64), 1);
+  for (const IterVar &iv : op.MakeIterVars()) {
+    total_elements = total_elements * cast(DataType::Int(64), iv->dom->extent);
+  }
+  PrimExpr simplified_total = analyzer->Simplify(total_elements);
+  const int64_t *total = as_const_int(simplified_total);
+  if (total == nullptr || *total <= 0) {
+    return {PPUAsyncCopyWidthAction::kNotApplicable, min_elements};
+  }
+
+  Buffer actual_src =
+      buffer_remap.count(op.src) ? buffer_remap[op.src] : op.src;
+  Buffer actual_dst =
+      buffer_remap.count(op.dst) ? buffer_remap[op.dst] : op.dst;
+  if (!HasSafeFourByteAlignedBase(actual_src, analyzer) ||
+      !HasSafeFourByteAlignedBase(actual_dst, analyzer)) {
+    // This is a safety failure, not merely an inapplicable width promotion.
+    // Leaving the loop unchanged could still let the common vectorizer choose
+    // a naturally wide cp.async from a base whose alignment is unproven.
+    return {PPUAsyncCopyWidthAction::kForceSynchronous, min_elements};
+  }
+
+  // Keep v1 within the measured one-wave scale-slab case.  Larger copies can
+  // make the padding heuristic choose widths above the requested floor and
+  // need separate performance qualification.
+  if (*total % min_elements != 0) {
+    return {PPUAsyncCopyWidthAction::kForceSynchronous, min_elements};
+  }
+  PrimExpr simplified_threads = analyzer->Simplify(thread_bounds->extent);
+  const int64_t *threads = as_const_int(simplified_threads);
+  if (threads == nullptr || *threads <= 0 || *total > *threads) {
+    // Do not add a minimum-width hint outside the measured one-wave case, but
+    // still validate it: the common vectorizer may independently select a
+    // naturally wide cp.async.
+    return {PPUAsyncCopyWidthAction::kValidateNaturalWidth, min_elements};
+  }
+  return {PPUAsyncCopyWidthAction::kPromote, min_elements};
+}
+
+std::optional<PrimExpr>
+LinearOffsetOfIndices(const Buffer &logical_buffer, Array<PrimExpr> indices,
+                      const Map<Buffer, Buffer> &buffer_remap,
+                      const LayoutMap &layout_map) {
+  if (indices.size() != logical_buffer->shape.size()) {
+    return std::nullopt;
+  }
+
+  Buffer physical_buffer = logical_buffer;
+  if (buffer_remap.count(logical_buffer)) {
+    if (!layout_map.count(logical_buffer)) {
+      return std::nullopt;
+    }
+    indices = layout_map[logical_buffer]->Forward(indices);
+    physical_buffer = buffer_remap[logical_buffer];
+  }
+  if (indices.size() != physical_buffer->shape.size()) {
+    return std::nullopt;
+  }
+
+  Array<PrimExpr> physical = physical_buffer.OffsetOf(indices);
+  Buffer flattened = physical_buffer.GetFlattenedBuffer();
+  if (physical.empty() || physical.size() != flattened->shape.size()) {
+    return std::nullopt;
+  }
+  PrimExpr linear = physical[0];
+  for (size_t axis = 1; axis < physical.size(); ++axis) {
+    linear = linear * flattened->shape[axis] + physical[axis];
+  }
+  return linear;
+}
+
+std::optional<size_t> GetSingleActiveAxis(const Array<Range> &ranges,
+                                          arith::Analyzer *analyzer) {
+  std::optional<size_t> active_axis;
+  for (size_t axis = 0; axis < ranges.size(); ++axis) {
+    if (analyzer->CanProveEqual(ranges[axis]->extent, 1)) {
+      continue;
+    }
+    if (active_axis.has_value()) {
+      return std::nullopt;
+    }
+    active_axis = axis;
+  }
+  return active_axis;
+}
+
+bool HasAlignedPPUAsyncCopyTransactions(const Buffer &logical_buffer,
+                                        const Array<Range> &ranges,
+                                        int transaction_elements,
+                                        const Map<Buffer, Buffer> &buffer_remap,
+                                        const LayoutMap &layout_map,
+                                        arith::Analyzer *analyzer) {
+  auto active_axis = GetSingleActiveAxis(ranges, analyzer);
+  if (!active_axis.has_value()) {
+    return false;
+  }
+
+  PrimExpr simplified_extent =
+      analyzer->Simplify(ranges[active_axis.value()]->extent);
+  const int64_t *extent = as_const_int(simplified_extent);
+  if (extent == nullptr || *extent <= 0 ||
+      *extent % transaction_elements != 0) {
+    return false;
+  }
+
+  Buffer physical_buffer = buffer_remap.count(logical_buffer)
+                               ? buffer_remap[logical_buffer]
+                               : logical_buffer;
+  int64_t physical_element_bits =
+      static_cast<int64_t>(physical_buffer->dtype.bits()) *
+      physical_buffer->dtype.lanes();
+
+  Array<PrimExpr> indices;
+  indices.reserve(ranges.size());
+  for (const Range &range : ranges) {
+    indices.push_back(range->min);
+  }
+
+  // The common vectorizer proves unit stride inside each vector transaction.
+  // Here, prove the complementary condition that every transaction begins on
+  // a four-byte boundary after the final layout remap.
+  const Range &active_range = ranges[active_axis.value()];
+  auto transaction_is_aligned = [&](PrimExpr delta) {
+    indices.Set(active_axis.value(), active_range->min + delta);
+    auto physical_offset = LinearOffsetOfIndices(logical_buffer, indices,
+                                                 buffer_remap, layout_map);
+    if (!physical_offset.has_value()) {
+      return false;
+    }
+    PrimExpr bit_offset = cast(DataType::Int(64), physical_offset.value()) *
+                          IntImm(DataType::Int(64), physical_element_bits);
+    return analyzer->CanProveEqual(
+        FloorMod(bit_offset, IntImm(DataType::Int(64), 32)),
+        IntImm(DataType::Int(64), 0));
+  };
+
+  // First try to prove all transaction starts at once.  This keeps validation
+  // of naturally wide copies outside the one-wave promotion limit O(1).
+  Var transaction("ppu_async_copy_transaction", active_range->min.dtype());
+  PrimExpr symbolic_delta =
+      transaction * make_const(active_range->min.dtype(), transaction_elements);
+  if (transaction_is_aligned(symbolic_delta)) {
+    return true;
+  }
+
+  // Non-affine layouts may be provable only after substituting concrete
+  // indices.  Bound that fallback to the one-wave-scale cases this policy was
+  // measured for; larger unproven layouts conservatively use synchronous copy.
+  constexpr int64_t kMaxEnumeratedTransactions = 128;
+  int64_t transaction_count = *extent / transaction_elements;
+  if (transaction_count > kMaxEnumeratedTransactions) {
+    return false;
+  }
+  for (int64_t delta = 0; delta < *extent; delta += transaction_elements) {
+    if (!transaction_is_aligned(make_const(active_range->min.dtype(), delta))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool RequiresSynchronousPPUSubwordCopy(const CopyNode &op,
+                                       ppu::CopyInst copy_inst,
+                                       Range thread_bounds,
+                                       const Map<Buffer, Buffer> &buffer_remap,
+                                       const LayoutMap &layout_map,
+                                       arith::Analyzer *analyzer) {
+  PPUAsyncCopyWidthPlan plan = PlanPPUAsyncCopyWidth(
+      op, copy_inst, thread_bounds, buffer_remap, analyzer);
+  if (plan.action == PPUAsyncCopyWidthAction::kNotApplicable) {
+    return false;
+  }
+  if (plan.action == PPUAsyncCopyWidthAction::kForceSynchronous) {
+    return true;
+  }
+
+  // Auto-promote only complete, aligned four-byte transactions.  A mixed
+  // async-main/synchronous-tail lowering regressed all measured ragged cases,
+  // so an unaligned or non-divisible copy keeps the established synchronous
+  // lowering instead of being peeled.
+  if (!HasAlignedPPUAsyncCopyTransactions(op.src, op.src_range, plan.min_width,
+                                          buffer_remap, layout_map, analyzer) ||
+      !HasAlignedPPUAsyncCopyTransactions(op.dst, op.dst_range, plan.min_width,
+                                          buffer_remap, layout_map, analyzer)) {
+    return true;
+  }
+  return false;
+}
+
+For MakePPUSIMTLoop(const CopyNode &op, ppu::CopyInst copy_inst,
+                    Range thread_bounds,
+                    const Map<Buffer, Buffer> &buffer_remap,
+                    arith::Analyzer *analyzer) {
+  For loop = op.MakeSIMTLoop(analyzer);
+  PPUAsyncCopyWidthPlan plan = PlanPPUAsyncCopyWidth(
+      op, copy_inst, thread_bounds, buffer_remap, analyzer);
+  if (plan.action == PPUAsyncCopyWidthAction::kPromote) {
+    // This is a floor, not a forced width.  The common vectorizer still proves
+    // the final loop extent, remapped offsets, predicates, and unit stride.  If
+    // the required adjacent subword elements are not legal, the floor is
+    // ignored and the established synchronous fallback remains in effect.
+    loop.CopyOnWrite()->annotations.Set(
+        attr::kMinCoalescedWidth, IntImm(DataType::Int(32), plan.min_width));
+  }
+  return loop;
 }
 
 } // namespace
@@ -144,7 +425,16 @@ LayoutMap Copy::InferLayout(const CopyNode &op,
                  layout_args.analyzer, layout_args.buffer_oob);
   CheckParallelLoopLayout(op, copy_inst);
 
-  return op.InferSIMTLayout(layout_args, level);
+  if (!op.par_op_.defined()) {
+    // MakeSIMTLoop binds its fresh iteration variables.  Preserve outer-loop
+    // facts needed by the width policy without mutating the pass-owned
+    // analyzer, matching the isolation of CopyNode::InferSIMTLayout.
+    auto analyzer = layout_args.analyzer->Clone();
+    op.par_op_ =
+        ParallelOp(MakePPUSIMTLoop(op, copy_inst, layout_args.thread_bounds,
+                                   layout_args.buffer_remap, analyzer.get()));
+  }
+  return op.par_op_->InferLayout(layout_args, level);
 }
 
 void Copy::CheckParallelLoopLayout(const CopyNode &op, CopyInst copy_inst) {
@@ -218,7 +508,15 @@ Stmt Copy::LowerCPAsync(const CopyNode &op, const LowerArgs &lower_args,
     return LowerNormal(op, lower_args, analyzer);
   }
 
-  auto simt_loop = op.MakeSIMTLoop(analyzer);
+  if (RequiresSynchronousPPUSubwordCopy(
+          op, CopyInst::kCPAsync, lower_args.thread_bounds,
+          lower_args.buffer_remap, lower_args.layout_map, analyzer)) {
+    return LowerNormal(op, lower_args, analyzer);
+  }
+
+  auto simt_loop =
+      MakePPUSIMTLoop(op, CopyInst::kCPAsync, lower_args.thread_bounds,
+                      lower_args.buffer_remap, analyzer);
   auto fused_loop = Downcast<For>(ParallelLoopFuser::Fuse(simt_loop));
   auto par_op = ParallelOp(fused_loop);
 
